@@ -63,6 +63,9 @@ type ConnectionListener interface {
 	// ReceivedSendReceipt receive and process the return value of the send command.
 	ReceivedSendReceipt(response *pb.CommandSendReceipt)
 
+	// ReceivedSendQuotaExceededError receive and process the return send quota exceeded error of the send command.
+	ReceivedSendQuotaExceededError(sendError *pb.CommandSendError)
+
 	// ConnectionClosed close the TCP connection.
 	ConnectionClosed()
 }
@@ -799,6 +802,17 @@ func (c *connection) handleSendError(sendError *pb.CommandSendError) {
 				producerID, sendError.GetError())
 			return
 		}
+		c.log.Warnf("server error: %s: %s", sendError.GetError(), sendError.GetMessage())
+	case pb.ServerError_ProducerBlockedQuotaExceededException:
+		c.listenersLock.RLock()
+		producer, ok := c.listeners[producerID]
+		c.listenersLock.RUnlock()
+		if !ok {
+			c.log.Warnf("Received unexpected error response for producer %d of type %s",
+				producerID, sendError.GetError())
+			return
+		}
+		producer.ReceivedSendQuotaExceededError(sendError)
 		c.log.Warnf("server error: %s: %s", sendError.GetError(), sendError.GetMessage())
 	default:
 		// By default, for transient error, let the reconnection logic
