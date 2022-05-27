@@ -103,6 +103,8 @@ const (
 	SeekFailed
 	// ProducerClosed means producer already been closed
 	ProducerClosed
+	// TopicMismatchInvalidMessage means producer bound topic mismatches message topic property
+	TopicMismatchInvalidMessage
 )
 
 // Error implement error interface, composed of two parts: msg and result.
