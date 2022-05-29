@@ -31,7 +31,11 @@ import (
 	"github.com/apache/pulsar-client-go/pulsar/log"
 )
 
-const defaultNackRedeliveryDelay = 1 * time.Minute
+const (
+	defaultNackRedeliveryDelay = 1 * time.Minute
+	defaultPopMessagesNum      = 1
+	maxPopMessagesNum          = 20
+)
 
 type acker interface {
 	AckID(id trackingMessageID) error
@@ -142,6 +146,12 @@ func newConsumer(client *client, options ConsumerOptions) (Consumer, error) {
 	rlq, err := newRetryRouter(client, options.DLQ, options.RetryEnable, client.log)
 	if err != nil {
 		return nil, err
+	}
+
+	// Pop type subscription
+	if options.Type == Pop {
+		options.MessageChannel = nil
+		messageCh = nil
 	}
 
 	// normalize as FQDN topics
@@ -423,6 +433,9 @@ func (c *consumer) Unsubscribe() error {
 }
 
 func (c *consumer) Receive(ctx context.Context) (message Message, err error) {
+	if c.options.Type == Pop {
+		return nil, newError(OperationNotSupported, "Receive method not supported in pop type subscription")
+	}
 	start := time.Now()
 	defer func() {
 		now := time.Now().UnixNano()
@@ -446,6 +459,60 @@ func (c *consumer) Receive(ctx context.Context) (message Message, err error) {
 // Messages
 func (c *consumer) Chan() <-chan ConsumerMessage {
 	return c.messageCh
+}
+
+// Pop messages.
+func (c *consumer) Pop(num, timeoutMs int) ([]Message, error) {
+	if c.options.Type != Pop {
+		return nil, newError(OperationNotSupported, "Pop method only supported in pop type subscription")
+	}
+	if num <= 0 {
+		num = defaultPopMessagesNum
+	}
+	if num > maxPopMessagesNum {
+		num = maxPopMessagesNum
+	}
+	return c.internalPop(num, timeoutMs)
+}
+
+func (c *consumer) internalPop(num, timeoutMs int) ([]Message, error) {
+	select {
+	case <-c.closeCh:
+		return nil, newError(ConsumerClosed, "consumer closed")
+	default:
+	}
+
+	numPartCons := len(c.consumers)
+	randStart := rand.Intn(numPartCons)
+	nextTimeoutMs := timeoutMs
+	nextNum := num
+	popMsgs := make([]Message, 0)
+	for i := randStart; i < numPartCons+randStart; i++ {
+		start := time.Now()
+		msgs, err := c.consumers[i%numPartCons].pop(nextNum, nextTimeoutMs, false)
+		if err == nil {
+			popMsgs = append(popMsgs, msgs...)
+		}
+		nextTimeoutMs -= int(time.Since(start).Milliseconds())
+		nextNum -= len(msgs)
+		if nextTimeoutMs <= 0 || nextNum <= 0 {
+			if len(popMsgs) == 0 {
+				return nil, err
+			}
+			return popMsgs, nil
+		}
+	}
+
+	// Randomly select one partition to hold.
+	randHold := rand.Intn(numPartCons)
+	msgs, err := c.consumers[randHold].pop(nextNum, nextTimeoutMs, true)
+	if err == nil {
+		popMsgs = append(popMsgs, msgs...)
+	}
+	if len(popMsgs) == 0 {
+		return nil, err
+	}
+	return popMsgs, nil
 }
 
 // Ack the consumption of a single message
@@ -638,6 +705,8 @@ func toProtoSubType(st SubscriptionType) pb.CommandSubscribe_SubType {
 		return pb.CommandSubscribe_Failover
 	case KeyShared:
 		return pb.CommandSubscribe_Key_Shared
+	case Pop:
+		return pb.CommandSubscribe_Pop
 	}
 
 	return pb.CommandSubscribe_Exclusive

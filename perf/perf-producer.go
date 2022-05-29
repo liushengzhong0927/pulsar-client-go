@@ -90,6 +90,7 @@ func produce(produceArgs *ProduceArgs, stop <-chan struct{}) {
 		MaxPendingMessages:      produceArgs.ProducerQueueSize,
 		BatchingMaxPublishDelay: time.Millisecond * time.Duration(produceArgs.BatchingTimeMillis),
 		BatchingMaxSize:         uint(produceArgs.BatchingMaxSize * 1024),
+		DisableBatching:         true,
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -139,6 +140,10 @@ func produce(produceArgs *ProduceArgs, stop <-chan struct{}) {
 	defer tick.Stop()
 	q := quantile.NewTargeted(0.50, 0.95, 0.99, 0.999, 1.0)
 	messagesPublished := 0
+	totalPublished := 0
+	defer func() {
+		log.Infof(`Total Published: %d`, totalPublished)
+	}()
 
 	for {
 		select {
@@ -161,6 +166,7 @@ func produce(produceArgs *ProduceArgs, stop <-chan struct{}) {
 			messagesPublished = 0
 		case latency := <-ch:
 			messagesPublished++
+			totalPublished++
 			q.Insert(latency)
 		}
 	}

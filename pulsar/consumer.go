@@ -48,6 +48,9 @@ const (
 	// KeyShared subscription mode, multiple consumer will be able to use the same
 	// subscription and all messages with the same key will be dispatched to only one consumer
 	KeyShared
+
+	// Pop subscription mode, subscribing to multiple topics is not supported under this mode.
+	Pop
 )
 
 type SubscriptionInitialPosition int
@@ -198,6 +201,13 @@ type Consumer interface {
 
 	// Chan returns a channel to consume messages from
 	Chan() <-chan ConsumerMessage
+
+	// Pop messages.
+	//
+	// In Pop type subscription, this call blocks until one or more message is
+	// received or timeout expired. Nil messages and OperationNotSupported error
+	// will be returned in other subscription types.
+	Pop(num, timeoutMs int) ([]Message, error)
 
 	// Ack the consumption of a single message
 	Ack(Message) error
