@@ -22,18 +22,19 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/spf13/cobra"
-
-	log "github.com/sirupsen/logrus"
-
 	"github.com/apache/pulsar-client-go/pulsar"
+	log "github.com/sirupsen/logrus"
+	"github.com/spf13/cobra"
 )
 
 // ConsumeArgs define the parameters required by consume
 type ConsumeArgs struct {
 	Topic             string
 	SubscriptionName  string
+	SubscriptionType  string
 	ReceiverQueueSize int
+	PopNum            int
+	PopTimeoutMs      int
 }
 
 func newConsumerCommand() *cobra.Command {
@@ -54,8 +55,10 @@ func newConsumerCommand() *cobra.Command {
 
 	flags := cmd.Flags()
 	flags.StringVarP(&consumeArgs.SubscriptionName, "subscription", "s", "sub", "Subscription name")
+	flags.StringVarP(&consumeArgs.SubscriptionType, "subscription-type", "t", "Exclusive", "Subscription type")
 	flags.IntVarP(&consumeArgs.ReceiverQueueSize, "receiver-queue-size", "r", 1000, "Receiver queue size")
-
+	flags.IntVarP(&consumeArgs.PopNum, "pop-num", "n", 1, "pop num")
+	flags.IntVarP(&consumeArgs.PopTimeoutMs, "pop-timeout-ms", "m", 1000, "pop timeout ms")
 	return cmd
 }
 
@@ -73,9 +76,11 @@ func consume(consumeArgs *ConsumeArgs, stop <-chan struct{}) {
 
 	defer client.Close()
 
+	subType := strToSubType(consumeArgs.SubscriptionType)
 	consumer, err := client.Subscribe(pulsar.ConsumerOptions{
 		Topic:            consumeArgs.Topic,
 		SubscriptionName: consumeArgs.SubscriptionName,
+		Type:             subType,
 	})
 
 	if err != nil {
@@ -87,10 +92,39 @@ func consume(consumeArgs *ConsumeArgs, stop <-chan struct{}) {
 	// keep message stats
 	msgReceived := int64(0)
 	bytesReceived := int64(0)
+	totalReceived := int64(0)
 
 	// Print stats of the consume rate
 	tick := time.NewTicker(10 * time.Second)
 	defer tick.Stop()
+
+	if subType == pulsar.Pop {
+		for {
+			select {
+			case <-tick.C:
+				currentMsgReceived := atomic.SwapInt64(&msgReceived, 0)
+				currentBytesReceived := atomic.SwapInt64(&bytesReceived, 0)
+				msgRate := float64(currentMsgReceived) / float64(10)
+				bytesRate := float64(currentBytesReceived) / float64(10)
+
+				log.Infof(`Stats - Consume rate: %6.1f msg/s - %6.1f Mbps   Total received: %d`,
+					msgRate, bytesRate*8/1024/1024, totalReceived)
+			case <-stop:
+				return
+			default:
+				msgs, err := consumer.Pop(consumeArgs.PopNum, consumeArgs.PopTimeoutMs)
+				if err != nil {
+					continue
+				}
+				for _, m := range msgs {
+					msgReceived++
+					totalReceived++
+					bytesReceived += int64(len(m.Payload()))
+					consumer.Ack(m)
+				}
+			}
+		}
+	}
 
 	for {
 		select {
@@ -99,6 +133,7 @@ func consume(consumeArgs *ConsumeArgs, stop <-chan struct{}) {
 				return
 			}
 			msgReceived++
+			totalReceived++
 			bytesReceived += int64(len(cm.Message.Payload()))
 			consumer.Ack(cm.Message)
 		case <-tick.C:
@@ -107,10 +142,26 @@ func consume(consumeArgs *ConsumeArgs, stop <-chan struct{}) {
 			msgRate := float64(currentMsgReceived) / float64(10)
 			bytesRate := float64(currentBytesReceived) / float64(10)
 
-			log.Infof(`Stats - Consume rate: %6.1f msg/s - %6.1f Mbps`,
-				msgRate, bytesRate*8/1024/1024)
+			log.Infof(`Stats - Consume rate: %6.1f msg/s - %6.1f Mbps   Total received: %d`,
+				msgRate, bytesRate*8/1024/1024, totalReceived)
 		case <-stop:
 			return
 		}
 	}
+}
+
+func strToSubType(subtype string) pulsar.SubscriptionType {
+	switch subtype {
+	case "Exclusive":
+		return pulsar.Exclusive
+	case "Shared":
+		return pulsar.Shared
+	case "Failover":
+		return pulsar.Failover
+	case "KeyShared":
+		return pulsar.KeyShared
+	case "Pop":
+		return pulsar.Pop
+	}
+	return pulsar.Exclusive
 }

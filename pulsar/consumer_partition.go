@@ -20,6 +20,7 @@ package pulsar
 import (
 	"fmt"
 	"math"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -123,6 +124,9 @@ type partitionConsumer struct {
 	// shared channel
 	messageCh chan ConsumerMessage
 
+	// pop messages channel
+	popMessageCh chan []Message
+
 	// the number of message slots available
 	availablePermits int32
 
@@ -174,6 +178,9 @@ func newPartitionConsumer(parent Consumer, client *client, options *partitionCon
 		dlq:                  dlq,
 		metrics:              metrics,
 	}
+	if options.subscriptionType == Pop {
+		pc.popMessageCh = make(chan []Message, 10)
+	}
 	pc.setConsumerState(consumerInit)
 	pc.log = client.log.SubLogger(log.Fields{
 		"name":         pc.name,
@@ -224,7 +231,11 @@ func newPartitionConsumer(parent Consumer, client *client, options *partitionCon
 		}
 	}
 
-	go pc.dispatcher()
+	if pc.options.subscriptionType == Pop {
+		go pc.dispatcherForPop()
+	} else {
+		go pc.dispatcher()
+	}
 
 	go pc.runEventsLoop()
 
@@ -396,6 +407,7 @@ func (pc *partitionConsumer) internalSeek(seek *seekRequest) {
 	defer close(seek.doneCh)
 	seek.err = pc.requestSeek(seek.msgID.messageID)
 }
+
 func (pc *partitionConsumer) requestSeek(msgID messageID) error {
 	if err := pc.requestSeekWithoutClear(msgID); err != nil {
 		return err
@@ -494,7 +506,7 @@ func (pc *partitionConsumer) internalAck(req *ackRequest) {
 	pc.client.rpcClient.RequestOnCnxNoWait(pc._getConn(), pb.BaseCommand_ACK, cmdAck)
 }
 
-func (pc *partitionConsumer) MessageReceived(response *pb.CommandMessage, headersAndPayload internal.Buffer) error {
+func (pc *partitionConsumer) messageReceived(response *pb.CommandMessage, headersAndPayload internal.Buffer) ([]*message, error) {
 	pbMsgID := response.GetMessageId()
 
 	reader := internal.NewMessageReader(headersAndPayload)
@@ -502,12 +514,12 @@ func (pc *partitionConsumer) MessageReceived(response *pb.CommandMessage, header
 	if err != nil {
 		// todo optimize use more appropriate error codes
 		pc.discardCorruptedMessage(pbMsgID, pb.CommandAck_BatchDeSerializeError)
-		return err
+		return nil, err
 	}
 	msgMeta, err := reader.ReadMessageMetadata()
 	if err != nil {
 		pc.discardCorruptedMessage(pbMsgID, pb.CommandAck_ChecksumMismatch)
-		return err
+		return nil, err
 	}
 	decryptedPayload, err := pc.decryptor.Decrypt(headersAndPayload.ReadableSlice(), pbMsgID, msgMeta)
 	// error decrypting the payload
@@ -522,10 +534,10 @@ func (pc *partitionConsumer) MessageReceived(response *pb.CommandMessage, header
 		case crypto.ConsumerCryptoFailureActionFail:
 			pc.log.Errorf("consuming message failed due to decryption err :%v", err)
 			pc.NackID(newTrackingMessageID(int64(pbMsgID.GetLedgerId()), int64(pbMsgID.GetEntryId()), 0, 0, nil))
-			return err
+			return nil, err
 		case crypto.ConsumerCryptoFailureActionDiscard:
 			pc.discardCorruptedMessage(pbMsgID, pb.CommandAck_DecryptionError)
-			return fmt.Errorf("discarding message on decryption error :%v", err)
+			return nil, fmt.Errorf("discarding message on decryption error :%v", err)
 		case crypto.ConsumerCryptoFailureActionConsume:
 			pc.log.Warnf("consuming encrypted message due to error in decryption :%v", err)
 			messages := []*message{
@@ -551,8 +563,7 @@ func (pc *partitionConsumer) MessageReceived(response *pb.CommandMessage, header
 					orderingKey:         string(msgMeta.OrderingKey),
 				},
 			}
-			pc.queueCh <- messages
-			return nil
+			return messages, nil
 		}
 	}
 
@@ -560,7 +571,7 @@ func (pc *partitionConsumer) MessageReceived(response *pb.CommandMessage, header
 	uncompressedHeadersAndPayload, err := pc.Decompress(msgMeta, internal.NewBufferWrapper(decryptedPayload))
 	if err != nil {
 		pc.discardCorruptedMessage(pbMsgID, pb.CommandAck_DecompressionError)
-		return err
+		return nil, err
 	}
 
 	// Reset the reader on the uncompressed buffer
@@ -585,7 +596,7 @@ func (pc *partitionConsumer) MessageReceived(response *pb.CommandMessage, header
 		smm, payload, err := reader.ReadMessage()
 		if err != nil || payload == nil {
 			pc.discardCorruptedMessage(pbMsgID, pb.CommandAck_BatchDeSerializeError)
-			return err
+			return nil, err
 		}
 
 		pc.metrics.BytesReceived.Add(float64(len(payload)))
@@ -662,9 +673,58 @@ func (pc *partitionConsumer) MessageReceived(response *pb.CommandMessage, header
 		messages = append(messages, msg)
 	}
 
+	return messages, nil
+}
+
+func (pc *partitionConsumer) MessageReceived(response *pb.CommandMessage, headersAndPayload internal.Buffer) error {
+	messages, err := pc.messageReceived(response, headersAndPayload)
+	if err != nil {
+		return err
+	}
 	// send messages to the dispatcher
 	pc.queueCh <- messages
 	return nil
+}
+
+func (pc *partitionConsumer) PopMessagesReceived(response *pb.CommandPopResponse) error {
+	numCm := len(response.GetMessage())
+	numPl := len(response.GetPayload())
+	if numCm != numPl {
+		return fmt.Errorf("received Message slice length: %d mismatch Payload slice length: %d", numCm, numPl)
+	}
+	if numCm == 0 {
+		return fmt.Errorf("received empty Message slice")
+	}
+	cmdMessages := response.GetMessage()
+	payloads := response.GetPayload()
+	messages := make([]*message, 0, numCm)
+	wg := sync.WaitGroup{}
+	mutex := sync.Mutex{}
+	for i := 0; i < numCm; i++ {
+		wg.Add(1)
+		go func(index int, wg *sync.WaitGroup, mutex *sync.Mutex) {
+			defer wg.Done()
+			msgs, err := pc.messageReceived(cmdMessages[index], internal.NewBufferWrapper(payloads[index]))
+			if err != nil {
+				pc.log.
+					WithError(err).
+					WithField("consumerID", cmdMessages[index].GetConsumerId()).
+					Error("handle message ID: ", cmdMessages[index].GetMessageId())
+				return
+			}
+			mutex.Lock()
+			messages = append(messages, msgs...)
+			mutex.Unlock()
+		}(i, &wg, &mutex)
+	}
+	wg.Wait()
+	pc.queueCh <- messages
+	return nil
+}
+
+func (pc *partitionConsumer) EmptyPopMessagesReceived() {
+	// use message{} to represents no messages received from pop.
+	pc.queueCh <- []*message{{}}
 }
 
 func (pc *partitionConsumer) messageShouldBeDiscarded(msgID trackingMessageID) bool {
@@ -863,6 +923,89 @@ func (pc *partitionConsumer) dispatcher() {
 			if err := pc.internalFlow(initialPermits); err != nil {
 				pc.log.WithError(err).Error("unable to send initial permits to broker")
 			}
+
+			close(doneCh)
+		}
+	}
+}
+
+// dispatcherForPop manages the internal message queue channel
+// of pop type subscription. (dispatcher impl without internal flow)
+func (pc *partitionConsumer) dispatcherForPop() {
+	defer func() {
+		pc.log.Debug("exiting dispatch loop")
+	}()
+
+	var messages []*message
+	for {
+		var queueCh chan []*message
+		var messageCh chan []Message
+		var nextPop []Message
+
+		if len(messages) > 0 {
+			for _, m := range messages {
+				nextPop = append(nextPop, m)
+				pc.metrics.PrefetchedMessages.Dec()
+				pc.metrics.PrefetchedBytes.Sub(float64(len(m.payLoad)))
+			}
+			// pass the message to application channel
+			messageCh = pc.popMessageCh
+		} else {
+			// we are ready for more messages
+			queueCh = pc.queueCh
+		}
+
+		select {
+		case <-pc.closeCh:
+			return
+
+		case _, ok := <-pc.connectedCh:
+			if !ok {
+				return
+			}
+			pc.log.Debug("dispatcher received connection event")
+
+			messages = nil
+
+		case msgs, ok := <-queueCh:
+			if !ok {
+				return
+			}
+			// we only read messages here after the consumer has processed all messages
+			// in the previous batch
+			messages = msgs
+
+		// if the messageCh is nil or the messageCh is full this will not be selected
+		case messageCh <- nextPop:
+			// allow these messages to be garbage collected
+			messages = messages[:0]
+
+		case clearQueueCb := <-pc.clearQueueCh:
+			// drain the message queue on any new connection by sending a
+			// special nil message to the channel so we know when to stop dropping messages
+			var nextMessageInQueue trackingMessageID
+			go func() {
+				pc.queueCh <- nil
+			}()
+			for m := range pc.queueCh {
+				// the queue has been drained
+				if m == nil {
+					break
+				} else if nextMessageInQueue.Undefined() {
+					nextMessageInQueue = m[0].msgID.(trackingMessageID)
+				}
+			}
+
+			clearQueueCb(nextMessageInQueue)
+
+		case doneCh := <-pc.clearMessageQueuesCh:
+			for len(pc.queueCh) > 0 {
+				<-pc.queueCh
+			}
+			for len(pc.popMessageCh) > 0 {
+				<-pc.popMessageCh
+			}
+			messages = nil
 
 			close(doneCh)
 		}
@@ -1315,4 +1458,40 @@ func convertToMessageID(id *pb.MessageIdData) trackingMessageID {
 	}
 
 	return msgID
+}
+
+func (pc *partitionConsumer) pop(num, timeoutMs int, isHold bool) ([]Message, error) {
+	select {
+	case <-pc.closeCh:
+		return nil, newError(ConsumerClosed, "consumer closed")
+	default:
+	}
+
+	cmdPop := &pb.CommandPopRequest{
+		ConsumerId:    proto.Uint64(pc.consumerID),
+		PopNum:        proto.Uint32(uint32(num)),
+		IsHold:        proto.Bool(isHold),
+		PopTimeout:    proto.Uint32(uint32(timeoutMs)),
+		InvisibleTime: proto.Uint64(0), // FIXME: reserved
+		PopStartTime:  proto.Uint64(uint64(time.Now().UnixNano() / 1e6)),
+	}
+	if err := pc.client.rpcClient.RequestOnCnxNoWait(pc._getConn(), pb.BaseCommand_POP_REQUEST, cmdPop); err != nil {
+		return nil, err
+	}
+
+	// Blocking to wait for pop response.
+	t := time.NewTimer(time.Duration(timeoutMs+100) * time.Millisecond) // Additional 100ms is for RTT.
+	defer t.Stop()
+	select {
+	case <-pc.closeCh:
+		return nil, newError(consumerClosed, "consumer closed")
+	case msgs := <-pc.popMessageCh:
+		// Here message{} indicates no messages to pop.
+		if len(msgs) == 1 && reflect.DeepEqual(msgs[0], &message{}) {
+			return nil, newError(PopNoMessages, "no messages to pop")
+		}
+		return msgs, nil
+	case <-t.C:
+		return nil, newError(TimeoutError, "pop timeout")
+	}
 }

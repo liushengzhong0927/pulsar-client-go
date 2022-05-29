@@ -213,6 +213,10 @@ func baseCommand(cmdType pb.BaseCommand_Type, msg proto.Message) *pb.BaseCommand
 		cmd.GetLastMessageId = msg.(*pb.CommandGetLastMessageId)
 	case pb.BaseCommand_AUTH_RESPONSE:
 		cmd.AuthResponse = msg.(*pb.CommandAuthResponse)
+	case pb.BaseCommand_POP_REQUEST:
+		cmd.PopRequest = msg.(*pb.CommandPopRequest)
+	case pb.BaseCommand_POP_RESPONSE:
+		cmd.PopResponse = msg.(*pb.CommandPopResponse)
 	default:
 		panic(fmt.Sprintf("Missing command type: %v", cmdType))
 	}

@@ -84,6 +84,12 @@ type Connection interface {
 type ConsumerHandler interface {
 	MessageReceived(response *pb.CommandMessage, headersAndPayload Buffer) error
 
+	// PopMessagesReceived
+	PopMessagesReceived(*pb.CommandPopResponse) error
+
+	// EmptyPopMessagesReceived
+	EmptyPopMessagesReceived()
+
 	// ConnectionClosed close the TCP connection.
 	ConnectionClosed()
 }
@@ -563,6 +569,9 @@ func (c *connection) internalReceivedCommand(cmd *pb.BaseCommand, headersAndPayl
 	case pb.BaseCommand_MESSAGE:
 		c.handleMessage(cmd.GetMessage(), headersAndPayload)
 
+	case pb.BaseCommand_POP_RESPONSE:
+		c.handlePopResponse(cmd.PopResponse)
+
 	case pb.BaseCommand_PING:
 		c.handlePing()
 	case pb.BaseCommand_PONG:
@@ -704,6 +713,26 @@ func (c *connection) handleMessage(response *pb.CommandMessage, payload Buffer) 
 		}
 	} else {
 		c.log.WithField("consumerID", consumerID).Warn("Got unexpected message: ", response.MessageId)
+	}
+}
+
+func (c *connection) handlePopResponse(response *pb.CommandPopResponse) {
+	c.log.Debug("Got pop response: ", response)
+	consumerID := response.GetConsumerId()
+	if consumer, ok := c.consumerHandler(consumerID); ok {
+		rc := response.GetResultCode()
+		switch rc {
+		case pb.CommandPopResponse_HAS_MESSAGE:
+			if err := consumer.PopMessagesReceived(response); err != nil {
+				c.log.WithError(err).WithField("consumerID", consumerID)
+			}
+		case pb.CommandPopResponse_NO_MESSAGE:
+			consumer.EmptyPopMessagesReceived()
+		default:
+			c.log.WithField("consumerID", consumerID).Warn("Got unexpected pop response ResultCode: ", rc)
+		}
+	} else {
+		c.log.WithField("consumerID", consumerID).Warn("Got unexpected pop response: ", response)
 	}
 }
 

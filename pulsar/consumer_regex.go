@@ -137,6 +137,9 @@ func (c *regexConsumer) Unsubscribe() error {
 }
 
 func (c *regexConsumer) Receive(ctx context.Context) (message Message, err error) {
+	if c.options.Type == Pop {
+		return nil, newError(OperationNotSupported, "Receive method not supported in pop type subscription")
+	}
 	for {
 		select {
 		case <-c.closeCh:
@@ -155,6 +158,14 @@ func (c *regexConsumer) Receive(ctx context.Context) (message Message, err error
 // Chan
 func (c *regexConsumer) Chan() <-chan ConsumerMessage {
 	return c.messageCh
+}
+
+// Pop messages.
+func (c *regexConsumer) Pop(num, timeoutMs int) ([]Message, error) {
+	if c.options.Type != Pop {
+		return nil, newError(OperationNotSupported, "Pop method only supported in pop type subscription")
+	}
+	return nil, nil
 }
 
 // Ack the consumption of a single message

@@ -332,6 +332,7 @@ message CommandSubscribe {
         Shared    = 1;
         Failover  = 2;
         Key_Shared = 3;
+        Pop = 4;
     }
     required string topic        = 1;
     required string subscription = 2;
@@ -875,6 +876,27 @@ message CommandEndTxnOnSubscriptionResponse {
     optional string message = 5;
 }
 
+message CommandPopRequest {
+    required uint64 consumer_id = 1;
+    required uint32 popNum = 2;
+    optional uint64 invisibleTime = 3; // during ms
+    required uint64 popStartTime = 4; // start time ms
+    required bool isHold = 5;
+    required uint32 popTimeout = 6;
+}
+
+message CommandPopResponse {
+    enum ResultCode {
+        HAS_MESSAGE = 1;
+        NO_MESSAGE = 2;
+    }
+    required uint64 consumer_id = 1;
+    required uint64 restNum = 2;
+    required ResultCode resultCode = 3;
+    repeated CommandMessage message = 4;
+    repeated bytes payload = 5;
+}
+
 message BaseCommand {
     enum Type {
         CONNECT     = 2;
@@ -960,6 +982,9 @@ message BaseCommand {
         TC_CLIENT_CONNECT_REQUEST = 62;
         TC_CLIENT_CONNECT_RESPONSE = 63;
 
+        POP_REQUEST = 198;
+        POP_RESPONSE = 199;
+
     }
 
 
@@ -1036,4 +1061,8 @@ message BaseCommand {
     optional CommandEndTxnOnSubscriptionResponse endTxnOnSubscriptionResponse = 61;
     optional CommandTcClientConnectRequest tcClientConnectRequest = 62;
     optional CommandTcClientConnectResponse tcClientConnectResponse = 63;
+
+    optional CommandPopRequest popRequest                = 198;
+    optional CommandPopResponse popResponse                = 199;
+
 }

@@ -64,6 +64,10 @@ func (c *mockConsumer) Chan() <-chan pulsar.ConsumerMessage {
 	return nil
 }
 
+func (c *mockConsumer) Pop(num, timeoutMs int) ([]pulsar.Message, error) {
+	return nil, nil
+}
+
 func (c *mockConsumer) Ack(msg pulsar.Message) {}
 
 func (c *mockConsumer) AckID(msgID pulsar.MessageID) {}
