@@ -518,7 +518,7 @@ func (c *consumer) internalPop(num, timeoutMs int) ([]Message, error) {
 		}
 		nextTimeoutMs -= int(time.Since(start).Milliseconds())
 		nextNum -= len(msgs)
-		if nextTimeoutMs <= 0 || nextNum <= 0 {
+		if nextTimeoutMs <= 50 || nextNum <= 0 {
 			break
 		}
 		holdPartition++
