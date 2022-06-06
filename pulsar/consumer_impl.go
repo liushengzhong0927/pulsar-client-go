@@ -503,11 +503,28 @@ func (c *consumer) internalPop(num, timeoutMs int) ([]Message, error) {
 		}
 	}
 
-	// Randomly select one partition to hold.
-	randHold := rand.Intn(numPartCons)
-	msgs, err := c.consumers[randHold].pop(nextNum, nextTimeoutMs, true)
-	if err == nil {
-		popMsgs = append(popMsgs, msgs...)
+	var err error
+	var msgs []Message
+	holdPartition := rand.Intn(numPartCons)
+	for {
+		start := time.Now()
+		holdTimeoutMs := 1000 // FIXME: Set max hold time to 1000 ms to consume messages produced during holding in time.
+		if nextTimeoutMs < holdTimeoutMs {
+			holdTimeoutMs = nextTimeoutMs
+		}
+		msgs, err = c.consumers[holdPartition].pop(nextNum, holdTimeoutMs, true)
+		if err == nil {
+			popMsgs = append(popMsgs, msgs...)
+		}
+		nextTimeoutMs -= int(time.Since(start).Milliseconds())
+		nextNum -= len(msgs)
+		if nextTimeoutMs <= 0 || nextNum <= 0 {
+			break
+		}
+		holdPartition++
+		if holdPartition >= numPartCons {
+			holdPartition = 0
+		}
 	}
 	if len(popMsgs) == 0 {
 		return nil, err
